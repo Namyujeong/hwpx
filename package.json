@@ -1,6 +1,6 @@
 {
   "name": "hwpx-generator",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Generate HWPX files from markdown business plan content",
   "main": "index.js",
   "type": "commonjs",
