@@ -1,11 +1,30 @@
 const express = require("express");
 const AdmZip = require("adm-zip");
 const { DOMParser, XMLSerializer } = require("xmldom");
+const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.json({ limit: "20mb" }));
 
-// ===== 로그 유틸 =====
+const PORT = process.env.PORT || 3000;
+const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const TEMPLATE_DIR = path.join(__dirname, "templates");
+const OUTPUT_DIR = "/tmp/hwpx-output";
+
+if (!fs.existsSync(OUTPUT_DIR)) {
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+}
+
+// 기관별 템플릿 매핑
+const TEMPLATE_MAP = {
+  nipa: "nipa.hwpx",
+  koica: "koica.hwpx",
+  kocca: "kocca.hwpx"
+};
+
+// ===== 로그 =====
 function log(step, data = "") {
   console.log(`🟢 [${step}]`, data || "");
 }
@@ -20,7 +39,7 @@ function extractSections(doc) {
   log("템플릿 분석 시작");
 
   const nodes = doc.getElementsByTagName("hp:p");
-  let sections = [];
+  const sections = [];
 
   for (let i = 0; i < nodes.length; i++) {
     const t = nodes[i].getElementsByTagName("hp:t")[0];
@@ -39,7 +58,6 @@ function extractSections(doc) {
   }
 
   log("템플릿 섹션 수", sections.length);
-
   return sections;
 }
 
@@ -49,20 +67,22 @@ function splitSections(text) {
 
   const sections = {};
   const lines = text.split("\n");
-
   let current = null;
 
-  lines.forEach(line => {
-    if (/^#+\s|^\d+\./.test(line)) {
-      current = line.replace(/^#+\s*/, "").replace(/^\d+\.\s*/, "").trim();
-      sections[current] = [];
+  lines.forEach((line) => {
+    if (/^#+\s|^\d+\.\s/.test(line)) {
+      current = line
+        .replace(/^#+\s*/, "")
+        .replace(/^\d+\.\s*/, "")
+        .trim();
+
+      if (current) sections[current] = [];
     } else if (current) {
       sections[current].push(line);
     }
   });
 
   log("본문 섹션 수", Object.keys(sections).length);
-
   return sections;
 }
 
@@ -72,31 +92,27 @@ function isTable(line) {
 }
 
 function parseBlocks(lines) {
-  let blocks = [];
+  const blocks = [];
   let buffer = [];
   let mode = null;
 
-  lines.forEach(line => {
+  lines.forEach((line) => {
+    const nextMode = isTable(line) ? "table" : "text";
 
-    if (isTable(line)) {
-      if (mode !== "table") {
-        if (buffer.length) blocks.push({ type: mode, data: buffer });
-        buffer = [];
-        mode = "table";
+    if (mode !== nextMode) {
+      if (buffer.length) {
+        blocks.push({ type: mode, data: buffer });
       }
-      buffer.push(line);
-    } else {
-      if (mode !== "text") {
-        if (buffer.length) blocks.push({ type: mode, data: buffer });
-        buffer = [];
-        mode = "text";
-      }
-      buffer.push(line);
+      buffer = [];
+      mode = nextMode;
     }
 
+    buffer.push(line);
   });
 
-  if (buffer.length) blocks.push({ type: mode, data: buffer });
+  if (buffer.length) {
+    blocks.push({ type: mode, data: buffer });
+  }
 
   return blocks;
 }
@@ -104,12 +120,14 @@ function parseBlocks(lines) {
 // ===== 표 변환 =====
 function parseMarkdownTable(lines) {
   return lines
-    .filter(l => !l.includes("---"))
-    .map(line =>
-      line.split("|")
-        .map(c => c.trim())
+    .filter((l) => !/^\s*\|?[-:\s|]+\|?\s*$/.test(l))
+    .map((line) =>
+      line
+        .split("|")
+        .map((c) => c.trim())
         .filter(Boolean)
-    );
+    )
+    .filter((row) => row.length > 0);
 }
 
 // ===== 매칭 =====
@@ -118,13 +136,13 @@ function matchSection(templateSections, inputSections) {
 
   const map = {};
 
-  Object.keys(inputSections).forEach(inputTitle => {
+  Object.keys(inputSections).forEach((inputTitle) => {
     const normInput = normalize(inputTitle);
 
     let best = null;
     let score = 0;
 
-    templateSections.forEach(t => {
+    templateSections.forEach((t) => {
       if (t.norm.includes(normInput) || normInput.includes(t.norm)) {
         const s = Math.min(t.norm.length, normInput.length);
         if (s > score) {
@@ -146,7 +164,7 @@ function matchSection(templateSections, inputSections) {
 }
 
 // ===== 렌더 =====
-function cloneParagraph(doc, template, text) {
+function cloneParagraph(template, text) {
   const newP = template.cloneNode(true);
   const tNode = newP.getElementsByTagName("hp:t")[0];
   if (tNode) tNode.textContent = text;
@@ -156,10 +174,10 @@ function cloneParagraph(doc, template, text) {
 function createTable(doc, data) {
   const tbl = doc.createElement("hp:tbl");
 
-  data.forEach(row => {
+  data.forEach((row) => {
     const tr = doc.createElement("hp:tr");
 
-    row.forEach(cell => {
+    row.forEach((cell) => {
       const tc = doc.createElement("hp:tc");
       const p = doc.createElement("hp:p");
       const run = doc.createElement("hp:run");
@@ -182,22 +200,19 @@ function render(doc, templateSections, mapping) {
   log("렌더링 시작");
 
   Object.entries(mapping).forEach(([index, lines]) => {
-
     const section = templateSections[index];
     const anchor = section.node;
+    let cursor = anchor;
 
     log("렌더링 섹션", section.title);
 
-    let cursor = anchor;
     const blocks = parseBlocks(lines);
 
-    blocks.forEach(block => {
-
+    blocks.forEach((block) => {
       if (block.type === "text") {
-        block.data.forEach(line => {
+        block.data.forEach((line) => {
           if (!line.trim()) return;
-
-          const p = cloneParagraph(doc, anchor, line);
+          const p = cloneParagraph(anchor, line);
           cursor.parentNode.insertBefore(p, cursor.nextSibling);
           cursor = p;
         });
@@ -205,50 +220,83 @@ function render(doc, templateSections, mapping) {
 
       if (block.type === "table") {
         const data = parseMarkdownTable(block.data);
+        if (!data.length) return;
 
-        log("표 생성", data.length + " rows");
-
+        log("표 생성", `${data.length} rows`);
         const tbl = createTable(doc, data);
         cursor.parentNode.insertBefore(tbl, cursor.nextSibling);
         cursor = tbl;
       }
-
     });
-
   });
 
   return doc;
 }
 
-// ===== API =====
+// ===== 유틸 =====
+function getTemplatePath(templateId) {
+  const fileName = TEMPLATE_MAP[templateId];
+  if (!fileName) return null;
+  return path.join(TEMPLATE_DIR, fileName);
+}
+
+// ===== 기본 확인 =====
+app.get("/", (req, res) => {
+  res.json({
+    success: true,
+    message: "HWPX Generator API is running"
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
+
+app.get("/templates", (req, res) => {
+  const templates = Object.entries(TEMPLATE_MAP).map(([id, fileName]) => ({
+    id,
+    fileName
+  }));
+
+  res.json({
+    success: true,
+    templates
+  });
+});
+
+// ===== 생성 API =====
 app.post("/generate-hwpx", (req, res) => {
   try {
     log("요청 시작");
 
-    const { content } = req.body;
+    const { templateId, content } = req.body;
 
-    if (!content) {
+    if (!templateId) {
+      throw new Error("templateId 없음");
+    }
+
+    if (!content || typeof content !== "string") {
       throw new Error("content 없음");
     }
 
-    // 파일 존재 체크
-    const zip = new AdmZip("template.hwpx");
-    log("템플릿 로드 완료");
+    const templatePath = getTemplatePath(templateId);
+    if (!templatePath || !fs.existsSync(templatePath)) {
+      throw new Error("유효한 템플릿이 없음");
+    }
+
+    const zip = new AdmZip(templatePath);
+    log("템플릿 로드 완료", templatePath);
 
     const entry = zip.getEntry("Contents/section0.xml");
-
     if (!entry) {
       throw new Error("section0.xml 없음");
     }
 
     const xml = entry.getData().toString("utf-8");
-    log("XML 로드 완료");
-
     const doc = new DOMParser().parseFromString(xml, "text/xml");
 
     const templateSections = extractSections(doc);
     const inputSections = splitSections(content);
-
     const mapping = matchSection(templateSections, inputSections);
 
     if (Object.keys(mapping).length === 0) {
@@ -256,26 +304,30 @@ app.post("/generate-hwpx", (req, res) => {
     }
 
     const updated = render(doc, templateSections, mapping);
-
     const newXml = new XMLSerializer().serializeToString(updated);
 
-    zip.updateFile("Contents/section0.xml", Buffer.from(newXml));
+    zip.updateFile("Contents/section0.xml", Buffer.from(newXml, "utf-8"));
 
     const buffer = zip.toBuffer();
-
-    // 🔥 파일 검증
     if (!buffer || buffer.length < 2000) {
-      throw new Error("파일 생성 실패 (용량 이상)");
+      throw new Error("파일 생성 실패");
     }
 
-    log("파일 생성 성공", buffer.length + " bytes");
+    const fileId = crypto.randomUUID();
+    const outputFileName = `${templateId}-${fileId}.hwpx`;
+    const outputPath = path.join(OUTPUT_DIR, outputFileName);
+
+    fs.writeFileSync(outputPath, buffer);
+
+    const downloadUrl = `${BASE_URL}/download/${outputFileName}`;
+
+    log("파일 생성 성공", outputFileName);
 
     res.json({
       success: true,
-      file: buffer.toString("base64"),
-      filename: "result.hwpx"
+      filename: outputFileName,
+      downloadUrl
     });
-
   } catch (err) {
     console.error("❌ ERROR:", err.message);
 
@@ -286,7 +338,21 @@ app.post("/generate-hwpx", (req, res) => {
   }
 });
 
-// ===== 서버 =====
-app.listen(process.env.PORT || 3000, () => {
-  console.log("🚀 DEBUG SERVER RUNNING");
+// ===== 다운로드 =====
+app.get("/download/:fileName", (req, res) => {
+  const fileName = path.basename(req.params.fileName);
+  const filePath = path.join(OUTPUT_DIR, fileName);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({
+      success: false,
+      error: "파일이 없음"
+    });
+  }
+
+  res.download(filePath, fileName);
+});
+
+app.listen(PORT, () => {
+  console.log(`🚀 HWPX GENERATOR RUNNING ON ${PORT}`);
 });
