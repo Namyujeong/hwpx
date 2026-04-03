@@ -6,16 +6,12 @@ const path = require("path");
 const crypto = require("crypto");
 
 const app = express();
+app.set("trust proxy", true);
 app.use(express.json({ limit: "20mb" }));
 
 const PORT = process.env.PORT || 3000;
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
 const TEMPLATE_DIR = path.join(__dirname, "templates");
 const OUTPUT_DIR = "/tmp/hwpx-output";
-
-if (!fs.existsSync(OUTPUT_DIR)) {
-  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-}
 
 const TEMPLATE_MAP = {
   nipa: "nipa.hwpx",
@@ -23,14 +19,233 @@ const TEMPLATE_MAP = {
   kipo: "kipo.hwpx"
 };
 
+const DEFAULT_SPLIT_MODE = "auto"; // auto | force | off
+const DEFAULT_MAX_CHARS_SINGLE = 45000;
+const DEFAULT_MAX_CHARS_PER_PART = 22000;
+const MAX_WAIT_MS = 25000;
+const JOB_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
+
+const jobs = new Map();
+
+if (!fs.existsSync(OUTPUT_DIR)) {
+  fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+}
+
 function log(step, data = "") {
   console.log(`🟢 [${step}]`, data || "");
 }
 
-function normalize(text = "") {
-  return text.replace(/[\s\.\-ⅠⅡⅢIV0-9]/g, "").toLowerCase();
+function makeError(code, message, detail = undefined) {
+  const err = new Error(message);
+  err.code = code;
+  err.detail = detail;
+  return err;
 }
 
+function getTemplatePath(templateId) {
+  const fileName = TEMPLATE_MAP[templateId];
+  if (!fileName) return null;
+  return path.join(TEMPLATE_DIR, fileName);
+}
+
+function getBaseUrl(req) {
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const host = req.headers["x-forwarded-host"] || req.get("host");
+  return `${proto}://${host}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function cleanupOldJobs() {
+  const now = Date.now();
+
+  for (const [jobId, job] of jobs.entries()) {
+    if (now - job.createdAt > JOB_TTL_MS) {
+      jobs.delete(jobId);
+    }
+  }
+
+  try {
+    const files = fs.readdirSync(OUTPUT_DIR);
+    for (const file of files) {
+      const fullPath = path.join(OUTPUT_DIR, file);
+      const stat = fs.statSync(fullPath);
+      if (now - stat.mtimeMs > JOB_TTL_MS) {
+        fs.unlinkSync(fullPath);
+      }
+    }
+  } catch (err) {
+    console.error("cleanup error:", err.message);
+  }
+}
+
+setInterval(cleanupOldJobs, 1000 * 60 * 30);
+
+// ===== 입력 전처리 =====
+function sanitizeForXml(text = "") {
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .normalize("NFKC")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "");
+}
+
+function flattenCodeFences(text = "") {
+  const lines = text.split("\n");
+  const output = [];
+  let inFence = false;
+
+  for (const line of lines) {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+
+    if (inFence) {
+      output.push(`    ${line}`);
+    } else {
+      output.push(line);
+    }
+  }
+
+  return output.join("\n");
+}
+
+function preprocessContent(raw = "") {
+  return sanitizeForXml(flattenCodeFences(raw))
+    .replace(/\t/g, "    ")
+    .trim();
+}
+
+// ===== 제목/섹션 파싱 =====
+function normalizeTitle(text = "") {
+  return text.replace(/[\s\.\-ⅠⅡⅢIV0-9()\[\]_:]/g, "").toLowerCase();
+}
+
+function parseHeading(line) {
+  const md = line.match(/^\s{0,3}#{1,6}\s+(.+?)\s*$/);
+  if (md) return md[1].trim();
+
+  const numbered = line.match(/^\s{0,3}\d+(?:\.\d+)*[.)]?\s+(.+?)\s*$/);
+  if (numbered) return numbered[1].trim();
+
+  return null;
+}
+
+function splitSectionsOrdered(text) {
+  const safe = preprocessContent(text);
+  if (!safe) return [];
+
+  const lines = safe.split("\n");
+  const sections = [];
+  let currentTitle = null;
+  let currentLines = [];
+
+  for (const line of lines) {
+    const heading = parseHeading(line);
+
+    if (heading) {
+      if (currentTitle) {
+        sections.push({
+          title: currentTitle,
+          bodyLines: currentLines.slice()
+        });
+      }
+      currentTitle = heading;
+      currentLines = [];
+      continue;
+    }
+
+    if (currentTitle) {
+      currentLines.push(line);
+    }
+  }
+
+  if (currentTitle) {
+    sections.push({
+      title: currentTitle,
+      bodyLines: currentLines.slice()
+    });
+  }
+
+  // 제목이 하나도 없으면 전체를 하나의 임시 섹션으로 둠
+  if (sections.length === 0) {
+    return [
+      {
+        title: "본문",
+        bodyLines: safe.split("\n")
+      }
+    ];
+  }
+
+  return sections;
+}
+
+function sectionToMarkdown(section) {
+  return [`# ${section.title}`, ...section.bodyLines, ""].join("\n");
+}
+
+function sectionsToMarkdown(sections) {
+  return sections.map(sectionToMarkdown).join("\n").trim();
+}
+
+function makePartTitle(sections, index) {
+  if (!sections.length) return `Part ${index}`;
+  if (sections.length === 1) return sections[0].title;
+  return `${sections[0].title} ~ ${sections[sections.length - 1].title}`;
+}
+
+function planParts(content, splitMode, maxCharsSingle, maxCharsPerPart) {
+  const orderedSections = splitSectionsOrdered(content);
+  const fullMarkdown = sectionsToMarkdown(orderedSections);
+  const totalLength = fullMarkdown.length;
+
+  const shouldSplit =
+    splitMode === "force" ||
+    (splitMode === "auto" && totalLength > maxCharsSingle);
+
+  if (!shouldSplit) {
+    return [
+      {
+        partNumber: 1,
+        title: "전체",
+        content: fullMarkdown
+      }
+    ];
+  }
+
+  const parts = [];
+  let current = [];
+  let currentLen = 0;
+
+  for (const section of orderedSections) {
+    const sectionMarkdown = sectionToMarkdown(section);
+    const sectionLen = sectionMarkdown.length;
+
+    if (current.length > 0 && currentLen + sectionLen > maxCharsPerPart) {
+      parts.push(current);
+      current = [];
+      currentLen = 0;
+    }
+
+    current.push(section);
+    currentLen += sectionLen;
+  }
+
+  if (current.length > 0) {
+    parts.push(current);
+  }
+
+  return parts.map((group, idx) => ({
+    partNumber: idx + 1,
+    title: makePartTitle(group, idx + 1),
+    content: sectionsToMarkdown(group)
+  }));
+}
+
+// ===== 템플릿 분석 =====
 function extractSections(doc) {
   log("템플릿 분석 시작");
 
@@ -41,12 +256,12 @@ function extractSections(doc) {
     const t = nodes[i].getElementsByTagName("hp:t")[0];
     if (!t) continue;
 
-    const text = t.textContent.trim();
+    const text = (t.textContent || "").trim();
 
-    if (text.length > 0 && text.length < 50) {
+    if (text.length > 0 && text.length < 80) {
       sections.push({
         title: text,
-        norm: normalize(text),
+        norm: normalizeTitle(text),
         node: nodes[i],
         index: i
       });
@@ -57,32 +272,9 @@ function extractSections(doc) {
   return sections;
 }
 
-function splitSections(text) {
-  log("본문 파싱 시작");
-
-  const sections = {};
-  const lines = text.split("\n");
-  let current = null;
-
-  lines.forEach((line) => {
-    if (/^#+\s|^\d+\.\s/.test(line)) {
-      current = line
-        .replace(/^#+\s*/, "")
-        .replace(/^\d+\.\s*/, "")
-        .trim();
-
-      if (current) sections[current] = [];
-    } else if (current) {
-      sections[current].push(line);
-    }
-  });
-
-  log("본문 섹션 수", Object.keys(sections).length);
-  return sections;
-}
-
+// ===== 블록 파싱 =====
 function isTable(line) {
-  return line.trim().startsWith("|");
+  return /^\s*\|/.test(line);
 }
 
 function parseBlocks(lines) {
@@ -90,22 +282,22 @@ function parseBlocks(lines) {
   let buffer = [];
   let mode = null;
 
-  lines.forEach((line) => {
+  for (const line of lines) {
     const nextMode = isTable(line) ? "table" : "text";
 
     if (mode !== nextMode) {
       if (buffer.length) {
-        blocks.push({ type: mode, data: buffer });
+        blocks.push({ type: mode, data: buffer.slice() });
       }
       buffer = [];
       mode = nextMode;
     }
 
     buffer.push(line);
-  });
+  }
 
   if (buffer.length) {
-    blocks.push({ type: mode, data: buffer });
+    blocks.push({ type: mode, data: buffer.slice() });
   }
 
   return blocks;
@@ -113,62 +305,79 @@ function parseBlocks(lines) {
 
 function parseMarkdownTable(lines) {
   return lines
-    .filter((l) => !/^\s*\|?[-:\s|]+\|?\s*$/.test(l))
+    .filter((line) => !/^\s*\|?[-:\s|]+\|?\s*$/.test(line))
     .map((line) =>
       line
         .split("|")
-        .map((c) => c.trim())
+        .map((cell) => cell.trim())
         .filter(Boolean)
     )
     .filter((row) => row.length > 0);
 }
 
-function matchSection(templateSections, inputSections) {
+// ===== 섹션 매칭 =====
+function matchSections(templateSections, orderedInputSections) {
   log("섹션 매핑 시작");
 
-  const map = {};
+  const mapping = new Map();
+  const unmatched = [];
 
-  Object.keys(inputSections).forEach((inputTitle) => {
-    const normInput = normalize(inputTitle);
+  for (const inputSection of orderedInputSections) {
+    const normInput = normalizeTitle(inputSection.title);
 
     let best = null;
     let score = 0;
 
-    templateSections.forEach((t) => {
-      if (t.norm.includes(normInput) || normInput.includes(t.norm)) {
-        const s = Math.min(t.norm.length, normInput.length);
+    for (const templateSection of templateSections) {
+      if (
+        templateSection.norm.includes(normInput) ||
+        normInput.includes(templateSection.norm)
+      ) {
+        const s = Math.min(templateSection.norm.length, normInput.length);
         if (s > score) {
-          best = t;
+          best = templateSection;
           score = s;
         }
       }
-    });
-
-    if (best) {
-      map[best.index] = inputSections[inputTitle];
-      log("매핑 성공", `${inputTitle} → ${best.title}`);
-    } else {
-      log("매핑 실패", inputTitle);
     }
-  });
 
-  return map;
+    if (!best) {
+      unmatched.push(inputSection.title);
+      log("매핑 실패", inputSection.title);
+      continue;
+    }
+
+    const existing = mapping.get(best.index) || [];
+    if (existing.length > 0) {
+      existing.push("");
+      existing.push(`[${inputSection.title}]`);
+    }
+    existing.push(...inputSection.bodyLines);
+
+    mapping.set(best.index, existing);
+    log("매핑 성공", `${inputSection.title} → ${best.title} (nodeIndex=${best.index})`);
+  }
+
+  return { mapping, unmatched };
 }
 
+// ===== 렌더 =====
 function cloneParagraph(template, text) {
   const newP = template.cloneNode(true);
   const tNode = newP.getElementsByTagName("hp:t")[0];
-  if (tNode) tNode.textContent = text;
+  if (tNode) {
+    tNode.textContent = text;
+  }
   return newP;
 }
 
 function createTable(doc, data) {
   const tbl = doc.createElement("hp:tbl");
 
-  data.forEach((row) => {
+  for (const row of data) {
     const tr = doc.createElement("hp:tr");
 
-    row.forEach((cell) => {
+    for (const cell of row) {
       const tc = doc.createElement("hp:tc");
       const p = doc.createElement("hp:p");
       const run = doc.createElement("hp:run");
@@ -179,10 +388,10 @@ function createTable(doc, data) {
       p.appendChild(run);
       tc.appendChild(p);
       tr.appendChild(tc);
-    });
+    }
 
     tbl.appendChild(tr);
-  });
+  }
 
   return tbl;
 }
@@ -190,46 +399,236 @@ function createTable(doc, data) {
 function render(doc, templateSections, mapping) {
   log("렌더링 시작");
 
-  Object.entries(mapping).forEach(([index, lines]) => {
-    const section = templateSections[index];
+  const sectionByNodeIndex = new Map(
+    templateSections.map((section) => [section.index, section])
+  );
+
+  for (const [nodeIndex, lines] of mapping.entries()) {
+    const section = sectionByNodeIndex.get(Number(nodeIndex));
+
+    if (!section) {
+      throw makeError(
+        "SECTION_LOOKUP_MISSING",
+        `템플릿 섹션 조회 실패: ${nodeIndex}`
+      );
+    }
+
     const anchor = section.node;
     let cursor = anchor;
 
-    log("렌더링 섹션", section.title);
+    log("렌더링 섹션", `${section.title} (nodeIndex=${nodeIndex})`);
 
     const blocks = parseBlocks(lines);
 
-    blocks.forEach((block) => {
+    for (const block of blocks) {
       if (block.type === "text") {
-        block.data.forEach((line) => {
-          if (!line.trim()) return;
+        for (const line of block.data) {
+          if (!line.trim()) continue;
+
           const p = cloneParagraph(anchor, line);
           cursor.parentNode.insertBefore(p, cursor.nextSibling);
           cursor = p;
-        });
+        }
       }
 
       if (block.type === "table") {
         const data = parseMarkdownTable(block.data);
-        if (!data.length) return;
+        if (!data.length) continue;
 
         log("표 생성", `${data.length} rows`);
         const tbl = createTable(doc, data);
         cursor.parentNode.insertBefore(tbl, cursor.nextSibling);
         cursor = tbl;
       }
-    });
-  });
+    }
+  }
 
   return doc;
 }
 
-function getTemplatePath(templateId) {
-  const fileName = TEMPLATE_MAP[templateId];
-  if (!fileName) return null;
-  return path.join(TEMPLATE_DIR, fileName);
+// ===== HWPX 생성 =====
+function createOutputFileName(templateId, partNumber) {
+  const suffix = crypto.randomUUID();
+  return `${templateId}-part${partNumber}-${suffix}.hwpx`;
 }
 
+function generateHwpxFile({ templateId, content, baseUrl, partNumber, title }) {
+  const templatePath = getTemplatePath(templateId);
+  if (!templatePath || !fs.existsSync(templatePath)) {
+    throw makeError("INVALID_TEMPLATE", `유효한 템플릿이 없음: ${templateId}`);
+  }
+
+  const zip = new AdmZip(templatePath);
+  const entry = zip.getEntry("Contents/section0.xml");
+
+  if (!entry) {
+    throw makeError("MISSING_SECTION_XML", "section0.xml 없음");
+  }
+
+  const xml = entry.getData().toString("utf-8");
+  const doc = new DOMParser().parseFromString(xml, "text/xml");
+
+  const templateSections = extractSections(doc);
+  const orderedInputSections = splitSectionsOrdered(content);
+  const { mapping, unmatched } = matchSections(templateSections, orderedInputSections);
+
+  if (mapping.size === 0) {
+    throw makeError("NO_SECTION_MAPPING", "섹션 매핑 실패");
+  }
+
+  const updated = render(doc, templateSections, mapping);
+  const newXml = new XMLSerializer().serializeToString(updated);
+
+  zip.updateFile("Contents/section0.xml", Buffer.from(newXml, "utf-8"));
+
+  const buffer = zip.toBuffer();
+  if (!buffer || buffer.length < 2000) {
+    throw makeError("EMPTY_OUTPUT", "파일 생성 실패");
+  }
+
+  const filename = createOutputFileName(templateId, partNumber);
+  const filePath = path.join(OUTPUT_DIR, filename);
+  fs.writeFileSync(filePath, buffer);
+
+  return {
+    partNumber,
+    title,
+    filename,
+    downloadUrl: `${baseUrl}/download/${encodeURIComponent(filename)}`,
+    unmatchedHeadings: unmatched
+  };
+}
+
+// ===== Job 관리 =====
+function createJobRecord({ templateId, content, splitMode, maxCharsSingle, maxCharsPerPart, baseUrl }) {
+  const jobId = crypto.randomUUID();
+  const now = Date.now();
+
+  const job = {
+    jobId,
+    createdAt: now,
+    updatedAt: now,
+    status: "queued",
+    progress: 0,
+    step: "queued",
+    templateId,
+    content,
+    splitMode,
+    maxCharsSingle,
+    maxCharsPerPart,
+    baseUrl,
+    split: false,
+    totalParts: 0,
+    completedParts: 0,
+    files: [],
+    errorCode: null,
+    errorMessage: null
+  };
+
+  jobs.set(jobId, job);
+  return job;
+}
+
+function updateJob(jobId, patch) {
+  const job = jobs.get(jobId);
+  if (!job) return null;
+
+  Object.assign(job, patch, { updatedAt: Date.now() });
+  jobs.set(jobId, job);
+  return job;
+}
+
+function publicJob(job) {
+  if (!job) return null;
+
+  return {
+    success: true,
+    jobId: job.jobId,
+    status: job.status,
+    progress: job.progress,
+    step: job.step,
+    templateId: job.templateId,
+    split: job.split,
+    totalParts: job.totalParts,
+    completedParts: job.completedParts,
+    files: job.files,
+    errorCode: job.errorCode,
+    errorMessage: job.errorMessage
+  };
+}
+
+async function processJob(jobId) {
+  const job = jobs.get(jobId);
+  if (!job) return;
+
+  try {
+    updateJob(jobId, {
+      status: "running",
+      step: "preprocessing",
+      progress: 5
+    });
+
+    const parts = planParts(
+      job.content,
+      job.splitMode,
+      job.maxCharsSingle,
+      job.maxCharsPerPart
+    );
+
+    updateJob(jobId, {
+      step: "planned",
+      progress: 15,
+      split: parts.length > 1,
+      totalParts: parts.length
+    });
+
+    const files = [];
+
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+
+      updateJob(jobId, {
+        step: `rendering_part_${part.partNumber}`,
+        progress: 15 + Math.round((i / parts.length) * 75)
+      });
+
+      const result = generateHwpxFile({
+        templateId: job.templateId,
+        content: part.content,
+        baseUrl: job.baseUrl,
+        partNumber: part.partNumber,
+        title: part.title
+      });
+
+      files.push(result);
+
+      updateJob(jobId, {
+        completedParts: i + 1,
+        files,
+        progress: 15 + Math.round(((i + 1) / parts.length) * 75)
+      });
+    }
+
+    updateJob(jobId, {
+      status: "done",
+      step: "done",
+      progress: 100,
+      files
+    });
+  } catch (err) {
+    console.error("❌ JOB ERROR:", err.message);
+
+    updateJob(jobId, {
+      status: "failed",
+      step: "failed",
+      progress: 100,
+      errorCode: err.code || "GENERATION_FAILED",
+      errorMessage: err.message
+    });
+  }
+}
+
+// ===== API =====
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -238,7 +637,10 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true });
+  res.json({
+    success: true,
+    ok: true
+  });
 });
 
 app.get("/templates", (req, res) => {
@@ -252,76 +654,89 @@ app.get("/templates", (req, res) => {
   });
 });
 
-app.post("/generate-hwpx", (req, res) => {
+app.post("/jobs", (req, res) => {
   try {
-    log("요청 시작");
-
-    const { templateId, content } = req.body;
+    const {
+      templateId,
+      content,
+      splitMode = DEFAULT_SPLIT_MODE,
+      maxCharsSingle = DEFAULT_MAX_CHARS_SINGLE,
+      maxCharsPerPart = DEFAULT_MAX_CHARS_PER_PART
+    } = req.body || {};
 
     if (!templateId) {
-      throw new Error("templateId 없음");
+      throw makeError("MISSING_TEMPLATE_ID", "templateId 없음");
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(TEMPLATE_MAP, templateId)) {
+      throw makeError("INVALID_TEMPLATE", `유효한 템플릿이 없음: ${templateId}`);
     }
 
     if (!content || typeof content !== "string") {
-      throw new Error("content 없음");
+      throw makeError("MISSING_CONTENT", "content 없음");
     }
 
-    const templatePath = getTemplatePath(templateId);
-    if (!templatePath || !fs.existsSync(templatePath)) {
-      throw new Error(`유효한 템플릿이 없음: ${templateId}`);
+    if (!["auto", "force", "off"].includes(splitMode)) {
+      throw makeError("INVALID_SPLIT_MODE", "splitMode는 auto, force, off 중 하나여야 함");
     }
 
-    const zip = new AdmZip(templatePath);
-    log("템플릿 로드 완료", templatePath);
+    const baseUrl = getBaseUrl(req);
+    const job = createJobRecord({
+      templateId,
+      content,
+      splitMode,
+      maxCharsSingle: Number(maxCharsSingle) || DEFAULT_MAX_CHARS_SINGLE,
+      maxCharsPerPart: Number(maxCharsPerPart) || DEFAULT_MAX_CHARS_PER_PART,
+      baseUrl
+    });
 
-    const entry = zip.getEntry("Contents/section0.xml");
-    if (!entry) {
-      throw new Error("section0.xml 없음");
-    }
+    setImmediate(() => {
+      processJob(job.jobId).catch((err) => {
+        console.error("processJob fatal:", err.message);
+      });
+    });
 
-    const xml = entry.getData().toString("utf-8");
-    const doc = new DOMParser().parseFromString(xml, "text/xml");
-
-    const templateSections = extractSections(doc);
-    const inputSections = splitSections(content);
-    const mapping = matchSection(templateSections, inputSections);
-
-    if (Object.keys(mapping).length === 0) {
-      throw new Error("섹션 매핑 실패");
-    }
-
-    const updated = render(doc, templateSections, mapping);
-    const newXml = new XMLSerializer().serializeToString(updated);
-
-    zip.updateFile("Contents/section0.xml", Buffer.from(newXml, "utf-8"));
-
-    const buffer = zip.toBuffer();
-    if (!buffer || buffer.length < 2000) {
-      throw new Error("파일 생성 실패");
-    }
-
-    const fileId = crypto.randomUUID();
-    const outputFileName = `${templateId}-${fileId}.hwpx`;
-    const outputPath = path.join(OUTPUT_DIR, outputFileName);
-
-    fs.writeFileSync(outputPath, buffer);
-
-    const downloadUrl = `${BASE_URL}/download/${encodeURIComponent(outputFileName)}`;
-
-    log("파일 생성 성공", outputFileName);
-
-    res.json({
+    res.status(202).json({
       success: true,
-      filename: outputFileName,
-      downloadUrl
+      jobId: job.jobId,
+      status: job.status,
+      pollUrl: `${baseUrl}/jobs/${job.jobId}`
     });
   } catch (err) {
-    console.error("❌ ERROR:", err.message);
-
-    res.status(500).json({
+    res.status(400).json({
       success: false,
-      error: err.message
+      errorCode: err.code || "BAD_REQUEST",
+      errorMessage: err.message
     });
+  }
+});
+
+app.get("/jobs/:jobId", async (req, res) => {
+  const { jobId } = req.params;
+  const waitMs = Math.min(Number(req.query.waitMs || 0), MAX_WAIT_MS);
+
+  const start = Date.now();
+
+  while (true) {
+    const job = jobs.get(jobId);
+
+    if (!job) {
+      return res.status(404).json({
+        success: false,
+        errorCode: "JOB_NOT_FOUND",
+        errorMessage: "jobId를 찾을 수 없음"
+      });
+    }
+
+    if (job.status === "done" || job.status === "failed") {
+      return res.json(publicJob(job));
+    }
+
+    if (!waitMs || Date.now() - start >= waitMs) {
+      return res.json(publicJob(job));
+    }
+
+    await sleep(700);
   }
 });
 
@@ -333,7 +748,8 @@ app.get("/download/:fileName", (req, res) => {
   if (!fs.existsSync(filePath)) {
     return res.status(404).json({
       success: false,
-      error: "파일이 없음"
+      errorCode: "FILE_NOT_FOUND",
+      errorMessage: "파일이 없음"
     });
   }
 
