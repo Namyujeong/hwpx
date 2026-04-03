@@ -1,11 +1,8 @@
 {
-  "name": "hwpx",
+  "name": "hwpx-generator",
   "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "adm-zip": "^0.5.10"
   }
 }
