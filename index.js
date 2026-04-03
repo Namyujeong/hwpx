@@ -17,24 +17,20 @@ if (!fs.existsSync(OUTPUT_DIR)) {
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 }
 
-// 실제 templates 폴더 안 파일명 기준
 const TEMPLATE_MAP = {
   nipa: "nipa.hwpx",
   webtoon: "webtoon.hwpx",
-  kipo: "지식재산처.hwpx"
+  kipo: "kipo.hwpx"
 };
 
-// ===== 로그 =====
 function log(step, data = "") {
   console.log(`🟢 [${step}]`, data || "");
 }
 
-// ===== 텍스트 정규화 =====
 function normalize(text = "") {
   return text.replace(/[\s\.\-ⅠⅡⅢIV0-9]/g, "").toLowerCase();
 }
 
-// ===== 템플릿 분석 =====
 function extractSections(doc) {
   log("템플릿 분석 시작");
 
@@ -61,7 +57,6 @@ function extractSections(doc) {
   return sections;
 }
 
-// ===== 입력 파싱 =====
 function splitSections(text) {
   log("본문 파싱 시작");
 
@@ -86,7 +81,6 @@ function splitSections(text) {
   return sections;
 }
 
-// ===== 블록 파싱 =====
 function isTable(line) {
   return line.trim().startsWith("|");
 }
@@ -117,7 +111,6 @@ function parseBlocks(lines) {
   return blocks;
 }
 
-// ===== 표 변환 =====
 function parseMarkdownTable(lines) {
   return lines
     .filter((l) => !/^\s*\|?[-:\s|]+\|?\s*$/.test(l))
@@ -130,7 +123,6 @@ function parseMarkdownTable(lines) {
     .filter((row) => row.length > 0);
 }
 
-// ===== 매칭 =====
 function matchSection(templateSections, inputSections) {
   log("섹션 매핑 시작");
 
@@ -163,7 +155,6 @@ function matchSection(templateSections, inputSections) {
   return map;
 }
 
-// ===== 렌더 =====
 function cloneParagraph(template, text) {
   const newP = template.cloneNode(true);
   const tNode = newP.getElementsByTagName("hp:t")[0];
@@ -233,14 +224,12 @@ function render(doc, templateSections, mapping) {
   return doc;
 }
 
-// ===== 유틸 =====
 function getTemplatePath(templateId) {
   const fileName = TEMPLATE_MAP[templateId];
   if (!fileName) return null;
   return path.join(TEMPLATE_DIR, fileName);
 }
 
-// ===== 기본 확인 =====
 app.get("/", (req, res) => {
   res.json({
     success: true,
@@ -258,12 +247,11 @@ app.get("/templates", (req, res) => {
     templates: [
       { id: "nipa", label: "NIPA", fileName: "nipa.hwpx" },
       { id: "webtoon", label: "웹툰", fileName: "webtoon.hwpx" },
-      { id: "kipo", label: "지식재산처", fileName: "지식재산처.hwpx" }
+      { id: "kipo", label: "지식재산처", fileName: "kipo.hwpx" }
     ]
   });
 });
 
-// ===== 생성 API =====
 app.post("/generate-hwpx", (req, res) => {
   try {
     log("요청 시작");
@@ -337,7 +325,6 @@ app.post("/generate-hwpx", (req, res) => {
   }
 });
 
-// ===== 다운로드 =====
 app.get("/download/:fileName", (req, res) => {
   const decodedFileName = decodeURIComponent(req.params.fileName);
   const fileName = path.basename(decodedFileName);
