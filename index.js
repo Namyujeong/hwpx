@@ -1,89 +1,10 @@
 const express = require("express");
-const fs = require("fs");
 const AdmZip = require("adm-zip");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// ✅ 헬스 체크
-app.get("/", (req, res) => {
-  res.send("ok");
-});
-
-// ✅ 텍스트 → 블록 파싱 (문단 / 표 구분)
-function parseContent(text) {
-  const lines = text.split("\n");
-
-  let blocks = [];
-  let tableBuffer = [];
-
-  for (let line of lines) {
-    line = line.trim();
-
-    if (!line) continue;
-
-    if (line.includes("\t")) {
-      tableBuffer.push(line);
-    } else {
-      if (tableBuffer.length > 0) {
-        blocks.push({ type: "table", data: tableBuffer });
-        tableBuffer = [];
-      }
-      blocks.push({ type: "text", data: line });
-    }
-  }
-
-  if (tableBuffer.length > 0) {
-    blocks.push({ type: "table", data: tableBuffer });
-  }
-
-  return blocks;
-}
-
-// ✅ 텍스트 → HWPX 문단 XML
-function textToXml(text) {
-  return `
-<hp:p>
-  <hp:run>
-    <hp:t>${escapeXml(text)}</hp:t>
-  </hp:run>
-</hp:p>`;
-}
-
-// ✅ 표 → HWPX XML
-function tableToXml(rows) {
-  let xml = `<hp:tbl>`;
-
-  rows.forEach(row => {
-    const cells = row.split("\t");
-
-    xml += `<hp:tr>`;
-    cells.forEach(cell => {
-      xml += `
-<hp:tc>
-  <hp:p>
-    <hp:run>
-      <hp:t>${escapeXml(cell)}</hp:t>
-    </hp:run>
-  </hp:p>
-</hp:tc>`;
-    });
-    xml += `</hp:tr>`;
-  });
-
-  xml += `</hp:tbl>`;
-  return xml;
-}
-
-// ✅ 전체 XML 생성
-function buildXml(blocks) {
-  return blocks.map(block => {
-    if (block.type === "text") return textToXml(block.data);
-    if (block.type === "table") return tableToXml(block.data);
-  }).join("\n");
-}
-
-// ✅ XML escape (필수)
+// ===== 유틸 =====
 function escapeXml(str) {
   return str
     .replace(/&/g, "&amp;")
@@ -91,49 +12,188 @@ function escapeXml(str) {
     .replace(/>/g, "&gt;");
 }
 
-// ✅ HWPX 생성 API
+// ===== 1. 템플릿 구조 분석 =====
+function extractTextNodes(xml) {
+  const matches = [...xml.matchAll(/<hp:t>(.*?)<\/hp:t>/g)];
+  return matches.map((m, i) => ({
+    index: i,
+    text: m[1]
+  }));
+}
+
+// ===== 2. 사용자 입력 파싱 =====
+function splitSections(text) {
+  const sections = {};
+  const lines = text.split("\n");
+
+  let current = null;
+
+  lines.forEach(line => {
+    if (/^\d+\./.test(line)) {
+      current = line.replace(/^\d+\.\s*/, "").trim();
+      sections[current] = [];
+    } else if (current) {
+      sections[current].push(line);
+    }
+  });
+
+  return sections;
+}
+
+// ===== 3. 표 / 문단 분리 =====
+function parseBlocks(lines) {
+  let blocks = [];
+  let tableBuffer = [];
+
+  lines.forEach(line => {
+    if (line.includes("\t")) {
+      tableBuffer.push(line);
+    } else {
+      if (tableBuffer.length) {
+        blocks.push({ type: "table", data: tableBuffer });
+        tableBuffer = [];
+      }
+      blocks.push({ type: "text", data: line });
+    }
+  });
+
+  if (tableBuffer.length) {
+    blocks.push({ type: "table", data: tableBuffer });
+  }
+
+  return blocks;
+}
+
+// ===== 4. 스타일 유지 문단 생성 =====
+function cloneParagraphTemplate(xml) {
+  const match = xml.match(/<hp:p[\s\S]*?<\/hp:p>/);
+  return match ? match[0] : null;
+}
+
+function buildParagraphs(templateP, text) {
+  return text.split("\n").map(line => {
+    return templateP.replace(
+      /<hp:t>.*?<\/hp:t>/,
+      `<hp:t>${escapeXml(line)}</hp:t>`
+    );
+  }).join("");
+}
+
+// ===== 5. 표 처리 (스타일 유지 핵심) =====
+function extractTable(xml) {
+  const match = xml.match(/<hp:tbl[\s\S]*?<\/hp:tbl>/);
+  return match ? match[0] : null;
+}
+
+function extractRowTemplate(tableXml) {
+  const match = tableXml.match(/<hp:tr[\s\S]*?<\/hp:tr>/);
+  return match ? match[0] : null;
+}
+
+function fillRow(rowTemplate, rowData) {
+  let i = 0;
+  return rowTemplate.replace(/<hp:t>.*?<\/hp:t>/g, () => {
+    const val = rowData[i++] || "";
+    return `<hp:t>${escapeXml(val)}</hp:t>`;
+  });
+}
+
+function buildTable(tableXml, tableData) {
+  const rowTemplate = extractRowTemplate(tableXml);
+
+  const newRows = tableData.map(row => {
+    const cells = row.split("\t");
+    return fillRow(rowTemplate, cells);
+  }).join("");
+
+  return tableXml.replace("</hp:tbl>", `${newRows}</hp:tbl>`);
+}
+
+// ===== 6. 제목 위치 찾기 =====
+function findPositions(templateNodes, sections) {
+  const map = {};
+
+  templateNodes.forEach((node, i) => {
+    Object.keys(sections).forEach(title => {
+      if (node.text.includes(title)) {
+        map[title] = i;
+      }
+    });
+  });
+
+  return map;
+}
+
+// ===== 7. XML 삽입 =====
+function injectContent(xml, nodes, sections, positions) {
+  let idx = 0;
+
+  return xml.replace(/<hp:t>(.*?)<\/hp:t>/g, (match) => {
+    let result = match;
+
+    Object.entries(positions).forEach(([title, pos]) => {
+      if (idx === pos) {
+        const lines = sections[title];
+        const blocks = parseBlocks(lines);
+
+        let sectionXml = "";
+
+        blocks.forEach(block => {
+          if (block.type === "text") {
+            const pTemplate = cloneParagraphTemplate(xml);
+            sectionXml += buildParagraphs(pTemplate, block.data);
+          }
+
+          if (block.type === "table") {
+            const tableTemplate = extractTable(xml);
+            if (tableTemplate) {
+              sectionXml += buildTable(tableTemplate, block.data);
+            }
+          }
+        });
+
+        result += sectionXml;
+      }
+    });
+
+    idx++;
+    return result;
+  });
+}
+
+// ===== API =====
 app.post("/generate-hwpx", (req, res) => {
   try {
     const { content } = req.body;
 
-    if (!content) {
-      return res.status(400).json({ error: "content 없음" });
-    }
-
-    // 🔥 템플릿 로드
     const zip = new AdmZip("template.hwpx");
-
-    // 🔥 본문 XML 가져오기
     const entry = zip.getEntry("Contents/section0.xml");
+
     let xml = entry.getData().toString("utf-8");
 
-    // 🔥 텍스트 → 구조 변환
-    const blocks = parseContent(content);
-    const generatedXml = buildXml(blocks);
+    const templateNodes = extractTextNodes(xml);
+    const sections = splitSections(content);
+    const positions = findPositions(templateNodes, sections);
 
-    // 🔥 템플릿 치환
-    xml = xml.replace("{{CONTENT}}", generatedXml);
+    xml = injectContent(xml, templateNodes, sections, positions);
 
-    // 🔥 다시 삽입
     zip.updateFile("Contents/section0.xml", Buffer.from(xml));
 
-    // 🔥 결과 생성
     const buffer = zip.toBuffer();
 
-    // ✅ GPT Actions 대응 (JSON + Base64)
     res.json({
       file: buffer.toString("base64"),
       filename: "result.hwpx"
     });
 
-  } catch (error) {
-    console.error("❌ 오류:", error);
-    res.status(500).json({ error: "HWPX 생성 실패" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "생성 실패" });
   }
 });
 
-// ✅ 서버 실행
+// ===== 서버 =====
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log(`🚀 Server running on port ${port}`);
+  console.log("🚀 server running");
 });
