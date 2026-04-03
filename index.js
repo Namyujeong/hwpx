@@ -21,7 +21,7 @@ if (!fs.existsSync(OUTPUT_DIR)) {
 const TEMPLATE_MAP = {
   nipa: "nipa.hwpx",
   webtoon: "webtoon.hwpx",
-  "지식재산처": "지식재산처.hwpx"
+  kipo: "지식재산처.hwpx"
 };
 
 // ===== 로그 =====
@@ -253,14 +253,13 @@ app.get("/health", (req, res) => {
 });
 
 app.get("/templates", (req, res) => {
-  const templates = Object.entries(TEMPLATE_MAP).map(([id, fileName]) => ({
-    id,
-    fileName
-  }));
-
   res.json({
     success: true,
-    templates
+    templates: [
+      { id: "nipa", label: "NIPA", fileName: "nipa.hwpx" },
+      { id: "webtoon", label: "웹툰", fileName: "webtoon.hwpx" },
+      { id: "kipo", label: "지식재산처", fileName: "지식재산처.hwpx" }
+    ]
   });
 });
 
@@ -314,13 +313,12 @@ app.post("/generate-hwpx", (req, res) => {
     }
 
     const fileId = crypto.randomUUID();
-    const safeTemplateId = encodeURIComponent(templateId);
-    const outputFileName = `${safeTemplateId}-${fileId}.hwpx`;
+    const outputFileName = `${templateId}-${fileId}.hwpx`;
     const outputPath = path.join(OUTPUT_DIR, outputFileName);
 
     fs.writeFileSync(outputPath, buffer);
 
-    const downloadUrl = `${BASE_URL}/download/${outputFileName}`;
+    const downloadUrl = `${BASE_URL}/download/${encodeURIComponent(outputFileName)}`;
 
     log("파일 생성 성공", outputFileName);
 
@@ -341,7 +339,8 @@ app.post("/generate-hwpx", (req, res) => {
 
 // ===== 다운로드 =====
 app.get("/download/:fileName", (req, res) => {
-  const fileName = path.basename(req.params.fileName);
+  const decodedFileName = decodeURIComponent(req.params.fileName);
+  const fileName = path.basename(decodedFileName);
   const filePath = path.join(OUTPUT_DIR, fileName);
 
   if (!fs.existsSync(filePath)) {
