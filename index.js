@@ -1,31 +1,9 @@
 const express = require("express");
 const AdmZip = require("adm-zip");
+const { DOMParser, XMLSerializer } = require("xmldom");
 
 const app = express();
 app.use(express.json({ limit: "10mb" }));
-
-// ===== 유틸 =====
-function escapeXml(str = "") {
-  return str
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-// ===== 템플릿 분석 =====
-function extractTextNodes(xml) {
-  const matches = [...xml.matchAll(/<hp:t>(.*?)<\/hp:t>/g)];
-  return matches.map((m, i) => ({
-    index: i,
-    text: m[1]
-  }));
-}
-
-function extractTables(xml) {
-  return [...xml.matchAll(/<hp:tbl[\s\S]*?<\/hp:tbl>/g)]
-    .map(m => m[0]);
-}
 
 // ===== 입력 파싱 =====
 function splitSections(text) {
@@ -70,139 +48,132 @@ function parseBlocks(lines) {
   return blocks;
 }
 
-// ===== 표 처리 =====
-function extractRowTemplate(tableXml) {
-  const match = tableXml.match(/<hp:tr[\s\S]*?<\/hp:tr>/);
-  return match ? match[0] : null;
+// ===== 스타일 복제 문단 =====
+function cloneParagraphWithText(doc, templateP, text) {
+  const newP = templateP.cloneNode(true);
+
+  const tNode = newP.getElementsByTagName("hp:t")[0];
+  if (tNode) {
+    tNode.textContent = text;
+  }
+
+  return newP;
 }
 
-function fillRow(rowTemplate, rowData) {
-  let i = 0;
-  return rowTemplate.replace(/<hp:t>.*?<\/hp:t>/g, () => {
-    const val = rowData[i++] || "";
-    return `<hp:t>${escapeXml(val)}</hp:t>`;
-  });
+// ===== 표 관련 =====
+function findNextTable(node) {
+  let current = node.nextSibling;
+
+  while (current) {
+    if (current.nodeName === "hp:tbl") return current;
+    current = current.nextSibling;
+  }
+
+  return null;
 }
 
-// 기존 표에 행 추가 (스타일 유지)
-function buildTableFromTemplate(tableXml, tableData) {
-  const rowTemplate = extractRowTemplate(tableXml);
-  if (!rowTemplate) return tableXml;
-
-  const newRows = tableData.map(row => {
-    const cells = row.split("\t");
-    return fillRow(rowTemplate, cells);
-  }).join("");
-
-  return tableXml.replace(
-    rowTemplate,
-    rowTemplate + newRows
-  );
-}
-
-// 새 표 생성 (템플릿에 없을 경우)
-function createTableXml(tableData) {
-  let xml = `<hp:tbl>`;
+function appendRowsToTable(tableNode, tableData) {
+  const rowTemplate = tableNode.getElementsByTagName("hp:tr")[0];
+  if (!rowTemplate) return;
 
   tableData.forEach(row => {
-    const cells = row.split("\t");
+    const newRow = rowTemplate.cloneNode(true);
+    const cells = newRow.getElementsByTagName("hp:t");
 
-    xml += `<hp:tr>`;
-
-    cells.forEach(cell => {
-      xml += `
-<hp:tc>
-  <hp:p>
-    <hp:run>
-      <hp:t>${escapeXml(cell)}</hp:t>
-    </hp:run>
-  </hp:p>
-</hp:tc>`;
+    row.split("\t").forEach((val, i) => {
+      if (cells[i]) cells[i].textContent = val;
     });
 
-    xml += `</hp:tr>`;
+    tableNode.appendChild(newRow);
   });
-
-  xml += `</hp:tbl>`;
-  return xml;
 }
 
-// ===== 위치 찾기 =====
-function findPositions(nodes, sections) {
-  const map = {};
+// ===== 새 표 생성 =====
+function createTable(doc, tableData) {
+  const tbl = doc.createElement("hp:tbl");
 
-  nodes.forEach((node, i) => {
-    Object.keys(sections).forEach(title => {
-      if (node.text.includes(title)) {
-        map[title] = i;
-      }
+  tableData.forEach(row => {
+    const tr = doc.createElement("hp:tr");
+    const cells = row.split("\t");
+
+    cells.forEach(cell => {
+      const tc = doc.createElement("hp:tc");
+
+      const p = doc.createElement("hp:p");
+      const run = doc.createElement("hp:run");
+      const t = doc.createElement("hp:t");
+
+      t.appendChild(doc.createTextNode(cell));
+
+      run.appendChild(t);
+      p.appendChild(run);
+      tc.appendChild(p);
+
+      tr.appendChild(tc);
     });
+
+    tbl.appendChild(tr);
   });
 
-  return map;
+  return tbl;
 }
 
 // ===== 핵심 삽입 =====
-function injectContentSafe(xml, nodes, sections, positions) {
-  let idx = 0;
+function injectContent(doc, sections) {
+  const textNodes = doc.getElementsByTagName("hp:t");
 
-  const tables = extractTables(xml);
-  let tableCursor = 0;
+  for (let i = 0; i < textNodes.length; i++) {
+    const node = textNodes[i];
+    const text = node.textContent;
 
-  return xml.replace(/<hp:t>(.*?)<\/hp:t>/g, (match) => {
-    let result = match;
+    Object.keys(sections).forEach(title => {
 
-    Object.entries(positions).forEach(([title, pos]) => {
-      if (idx === pos) {
+      if (!text.includes(title)) return;
 
-        // 공란 처리
-        if (!sections[title] || sections[title].length === 0) return;
+      const parentP = node.parentNode.parentNode; // hp:p
 
-        const blocks = parseBlocks(sections[title]);
-        let sectionXml = "";
+      const lines = sections[title];
+      if (!lines || lines.length === 0) return;
 
-        blocks.forEach(block => {
+      const blocks = parseBlocks(lines);
 
-          // ===== 문단 =====
-          if (block.type === "text") {
-            sectionXml += `
-<hp:p>
-  <hp:run>
-    <hp:t>${escapeXml(block.data)}</hp:t>
-  </hp:run>
-</hp:p>`;
+      let insertAfter = parentP;
+
+      blocks.forEach(block => {
+
+        // ===== 문단 (스타일 복제) =====
+        if (block.type === "text") {
+          const newP = cloneParagraphWithText(doc, parentP, block.data);
+
+          insertAfter.parentNode.insertBefore(newP, insertAfter.nextSibling);
+          insertAfter = newP;
+        }
+
+        // ===== 표 =====
+        if (block.type === "table") {
+
+          const nextTable = findNextTable(insertAfter);
+
+          // 1️⃣ 템플릿 표 → 스타일 유지
+          if (nextTable) {
+            appendRowsToTable(nextTable, block.data);
+            insertAfter = nextTable;
           }
+          // 2️⃣ 없으면 생성
+          else {
+            const newTable = createTable(doc, block.data);
 
-          // ===== 표 =====
-          if (block.type === "table") {
-
-            let tableXml;
-
-            // 1️⃣ 템플릿 표 사용
-            if (tables[tableCursor]) {
-              tableXml = buildTableFromTemplate(
-                tables[tableCursor],
-                block.data
-              );
-              tableCursor++;
-            }
-            // 2️⃣ 없으면 새로 생성
-            else {
-              tableXml = createTableXml(block.data);
-            }
-
-            sectionXml += tableXml;
+            insertAfter.parentNode.insertBefore(newTable, insertAfter.nextSibling);
+            insertAfter = newTable;
           }
+        }
 
-        });
+      });
 
-        result = match + sectionXml;
-      }
     });
+  }
 
-    idx++;
-    return result;
-  });
+  return doc;
 }
 
 // ===== API =====
@@ -221,13 +192,15 @@ app.post("/generate-hwpx", (req, res) => {
       return res.status(500).json({ error: "section0.xml 없음" });
     }
 
-    let xml = entry.getData().toString("utf-8");
+    const xml = entry.getData().toString("utf-8");
 
-    const nodes = extractTextNodes(xml);
+    const doc = new DOMParser().parseFromString(xml, "text/xml");
+
     const sections = splitSections(content);
-    const positions = findPositions(nodes, sections);
 
-    const newXml = injectContentSafe(xml, nodes, sections, positions);
+    const updatedDoc = injectContent(doc, sections);
+
+    const newXml = new XMLSerializer().serializeToString(updatedDoc);
 
     zip.updateFile("Contents/section0.xml", Buffer.from(newXml));
 
