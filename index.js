@@ -5,17 +5,21 @@ const { DOMParser, XMLSerializer } = require("xmldom");
 const app = express();
 app.use(express.json({ limit: "20mb" }));
 
-// ===== 1. 텍스트 정규화 =====
-function normalize(text = "") {
-  return text
-    .replace(/[\s\.\-ⅠⅡⅢIV0-9]/g, "")
-    .toLowerCase();
+// ===== 로그 유틸 =====
+function log(step, data = "") {
+  console.log(`🟢 [${step}]`, data || "");
 }
 
-// ===== 2. 템플릿 구조 분석 =====
-function extractSections(doc) {
-  const nodes = doc.getElementsByTagName("hp:p");
+// ===== 텍스트 정규화 =====
+function normalize(text = "") {
+  return text.replace(/[\s\.\-ⅠⅡⅢIV0-9]/g, "").toLowerCase();
+}
 
+// ===== 템플릿 분석 =====
+function extractSections(doc) {
+  log("템플릿 분석 시작");
+
+  const nodes = doc.getElementsByTagName("hp:p");
   let sections = [];
 
   for (let i = 0; i < nodes.length; i++) {
@@ -24,7 +28,7 @@ function extractSections(doc) {
 
     const text = t.textContent.trim();
 
-    if (text.length < 30) { // 제목 후보
+    if (text.length > 0 && text.length < 50) {
       sections.push({
         title: text,
         norm: normalize(text),
@@ -34,17 +38,15 @@ function extractSections(doc) {
     }
   }
 
-  // 경계 설정
-  for (let i = 0; i < sections.length; i++) {
-    sections[i].endIndex =
-      i < sections.length - 1 ? sections[i + 1].index : nodes.length;
-  }
+  log("템플릿 섹션 수", sections.length);
 
   return sections;
 }
 
-// ===== 3. 입력 파싱 =====
+// ===== 입력 파싱 =====
 function splitSections(text) {
+  log("본문 파싱 시작");
+
   const sections = {};
   const lines = text.split("\n");
 
@@ -59,10 +61,12 @@ function splitSections(text) {
     }
   });
 
+  log("본문 섹션 수", Object.keys(sections).length);
+
   return sections;
 }
 
-// ===== 4. Markdown 파싱 =====
+// ===== 블록 파싱 =====
 function isTable(line) {
   return line.trim().startsWith("|");
 }
@@ -97,6 +101,7 @@ function parseBlocks(lines) {
   return blocks;
 }
 
+// ===== 표 변환 =====
 function parseMarkdownTable(lines) {
   return lines
     .filter(l => !l.includes("---"))
@@ -107,8 +112,10 @@ function parseMarkdownTable(lines) {
     );
 }
 
-// ===== 5. 매칭 =====
+// ===== 매칭 =====
 function matchSection(templateSections, inputSections) {
+  log("섹션 매핑 시작");
+
   const map = {};
 
   Object.keys(inputSections).forEach(inputTitle => {
@@ -129,13 +136,16 @@ function matchSection(templateSections, inputSections) {
 
     if (best) {
       map[best.index] = inputSections[inputTitle];
+      log("매핑 성공", `${inputTitle} → ${best.title}`);
+    } else {
+      log("매핑 실패", inputTitle);
     }
   });
 
   return map;
 }
 
-// ===== 6. 렌더링 =====
+// ===== 렌더 =====
 function cloneParagraph(doc, template, text) {
   const newP = template.cloneNode(true);
   const tNode = newP.getElementsByTagName("hp:t")[0];
@@ -159,7 +169,6 @@ function createTable(doc, data) {
       run.appendChild(t);
       p.appendChild(run);
       tc.appendChild(p);
-
       tr.appendChild(tc);
     });
 
@@ -170,15 +179,16 @@ function createTable(doc, data) {
 }
 
 function render(doc, templateSections, mapping) {
-  const nodes = doc.getElementsByTagName("hp:p");
+  log("렌더링 시작");
 
   Object.entries(mapping).forEach(([index, lines]) => {
 
     const section = templateSections[index];
     const anchor = section.node;
 
-    let cursor = anchor;
+    log("렌더링 섹션", section.title);
 
+    let cursor = anchor;
     const blocks = parseBlocks(lines);
 
     blocks.forEach(block => {
@@ -195,8 +205,10 @@ function render(doc, templateSections, mapping) {
 
       if (block.type === "table") {
         const data = parseMarkdownTable(block.data);
-        const tbl = createTable(doc, data);
 
+        log("표 생성", data.length + " rows");
+
+        const tbl = createTable(doc, data);
         cursor.parentNode.insertBefore(tbl, cursor.nextSibling);
         cursor = tbl;
       }
@@ -211,12 +223,26 @@ function render(doc, templateSections, mapping) {
 // ===== API =====
 app.post("/generate-hwpx", (req, res) => {
   try {
+    log("요청 시작");
+
     const { content } = req.body;
 
+    if (!content) {
+      throw new Error("content 없음");
+    }
+
+    // 파일 존재 체크
     const zip = new AdmZip("template.hwpx");
+    log("템플릿 로드 완료");
+
     const entry = zip.getEntry("Contents/section0.xml");
 
+    if (!entry) {
+      throw new Error("section0.xml 없음");
+    }
+
     const xml = entry.getData().toString("utf-8");
+    log("XML 로드 완료");
 
     const doc = new DOMParser().parseFromString(xml, "text/xml");
 
@@ -224,6 +250,10 @@ app.post("/generate-hwpx", (req, res) => {
     const inputSections = splitSections(content);
 
     const mapping = matchSection(templateSections, inputSections);
+
+    if (Object.keys(mapping).length === 0) {
+      throw new Error("섹션 매핑 실패");
+    }
 
     const updated = render(doc, templateSections, mapping);
 
@@ -233,18 +263,30 @@ app.post("/generate-hwpx", (req, res) => {
 
     const buffer = zip.toBuffer();
 
+    // 🔥 파일 검증
+    if (!buffer || buffer.length < 2000) {
+      throw new Error("파일 생성 실패 (용량 이상)");
+    }
+
+    log("파일 생성 성공", buffer.length + " bytes");
+
     res.json({
+      success: true,
       file: buffer.toString("base64"),
       filename: "result.hwpx"
     });
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "생성 실패" });
+    console.error("❌ ERROR:", err.message);
+
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 
 // ===== 서버 =====
 app.listen(process.env.PORT || 3000, () => {
-  console.log("🚀 universal engine running");
+  console.log("🚀 DEBUG SERVER RUNNING");
 });
