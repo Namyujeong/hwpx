@@ -17,11 +17,11 @@ if (!fs.existsSync(OUTPUT_DIR)) {
   fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 }
 
-// 기관별 템플릿 매핑
+// 실제 templates 폴더 안 파일명 기준
 const TEMPLATE_MAP = {
   nipa: "nipa.hwpx",
-  koica: "koica.hwpx",
-  kocca: "kocca.hwpx"
+  webtoon: "webtoon.hwpx",
+  "지식재산처": "지식재산처.hwpx"
 };
 
 // ===== 로그 =====
@@ -281,7 +281,7 @@ app.post("/generate-hwpx", (req, res) => {
 
     const templatePath = getTemplatePath(templateId);
     if (!templatePath || !fs.existsSync(templatePath)) {
-      throw new Error("유효한 템플릿이 없음");
+      throw new Error(`유효한 템플릿이 없음: ${templateId}`);
     }
 
     const zip = new AdmZip(templatePath);
@@ -314,7 +314,8 @@ app.post("/generate-hwpx", (req, res) => {
     }
 
     const fileId = crypto.randomUUID();
-    const outputFileName = `${templateId}-${fileId}.hwpx`;
+    const safeTemplateId = encodeURIComponent(templateId);
+    const outputFileName = `${safeTemplateId}-${fileId}.hwpx`;
     const outputPath = path.join(OUTPUT_DIR, outputFileName);
 
     fs.writeFileSync(outputPath, buffer);
