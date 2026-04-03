@@ -1,9 +1,18 @@
 {
   "name": "hwpx-generator",
   "version": "1.0.0",
+  "description": "Generate HWPX files from markdown business plan content",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "express": "^4.18.2",
     "adm-zip": "^0.5.10",
+    "express": "^4.18.2",
     "xmldom": "^0.6.0"
   }
 }
